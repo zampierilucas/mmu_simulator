@@ -7,15 +7,9 @@
 #IncludeRegexTransform: 
 
 /home/zampierilucas/CLionProjects/mmu_simulator/main.c
-stdbool.h
--
 stdio.h
 -
 stdlib.h
--
-sys/file.h
--
-sys/wait.h
 -
 time.h
 -
@@ -24,5 +18,7 @@ unistd.h
 pthread.h
 -
 string.h
+-
+semaphore.h
 -
 
