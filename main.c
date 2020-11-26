@@ -11,7 +11,7 @@
 #pragma clang diagnostic push
 #pragma ide diagnostic ignored "EndlessLoop"
 
-int PID = 2;
+int PID = 1;
 
 // Data
 char *planet_names[] = {"Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"};
@@ -19,22 +19,22 @@ char *planet_names[] = {"Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn"
 typedef struct {
     int pid;
     int size;
+    int block;
     int date_start;
     char data[50];
 } PROCESS;
 
-// 64KB, divided in 8 frames of 8KB
+// 64KB, divided in 8 block of 8KB
 PROCESS mmu_pmem[8];
 
-// 1MB, divided in 124 pages of 8KB
-PROCESS mmu_vmem[124];
+PROCESS process_table[124];
 
 PROCESS empty_space = {.pid=0};
-PROCESS used_space = {.pid=1};
-PROCESS buffer;
+
+PROCESS write_buffer;
+int read_buffer;
 
 #define PMEM_ARR_SIZE sizeof(mmu_pmem) / sizeof(PROCESS)
-#define VMEM_ARR_SIZE sizeof(mmu_vmem) / sizeof(PROCESS)
 
 sem_t s0;
 
@@ -45,37 +45,26 @@ void mmu_init_pmem() {
 }
 
 // 1MB
-void mmu_init_vmem() {
-    for (int i = 0; i < VMEM_ARR_SIZE; i++)
-        mmu_vmem[i] = empty_space;
+void mmu_init_process_table() {
+    for (int i = 0; i < 124; i++)
+        process_table[i] = empty_space;
 }
 
-int mmu_search_for_empty_block(PROCESS arr[], int arr_size, int new_process_block_size) {
-    int i = 0, j = 0;
-    while (i <= arr_size) {
-        if (arr[i].pid == empty_space.pid) {
-            if (j == new_process_block_size) {
-//                printf("Found empty block of %d from %d ~ %d \n", j, i - new_process_block_size, i);
-                return i - new_process_block_size;
-            }
+int mmu_search_for_empty_frame(PROCESS *arr) {
+    int i = 0;
 
-            j++;
-        } else
-            j = 0;
+    while (i < PMEM_ARR_SIZE) {
+        if (arr[i].pid == empty_space.pid)
+            return i;
         i++;
     }
     return -1;
 }
 
-void mmu_store_process(PROCESS arr[], int arr_size, PROCESS new_process, int initial_position) {
-    for (int i = initial_position; i < initial_position + (new_process.size / 8); i++)
-        mmu_vmem[i] = new_process;
-}
-
-int mmu_search_for_oldest_block(PROCESS *arr, int arr_size) {
+int mmu_search_for_oldest_page(PROCESS *arr) {
     int oldest = (int) time(NULL);
     int oldest_pos = 0;
-    for (int i = 0; i < arr_size; i++) {
+    for (int i = 0; i < PMEM_ARR_SIZE; i++) {
         if (arr[i].pid == empty_space.pid)
             continue;
         else if (oldest > arr[i].date_start) {
@@ -87,71 +76,87 @@ int mmu_search_for_oldest_block(PROCESS *arr, int arr_size) {
 }
 
 
-void mmu_free_mem(PROCESS memory[], int memory_size, PROCESS new_process) {
-
-    // While there's not enough space for the new process
-    while (mmu_search_for_empty_block(memory, memory_size, new_process.size / 8) < 0) {
-        int initial_pos = mmu_search_for_oldest_block(memory, memory_size);
-
-        PROCESS process = memory[initial_pos];
-
-        printf("[FREE] pid=%d creation=%d from=%d~%d\n", process.pid, process.date_start,
-               initial_pos, initial_pos + (process.size / 8));
-
-        for (int i = initial_pos; i < initial_pos + (process.size / 8); i++)
-            memory[i] = empty_space;
-    }
+void mmu_free_mem(PROCESS memory[]) {
+    int initial_pos = mmu_search_for_oldest_page(memory);
+    printf("[MMU] Page Fault, free pid=%d date=%d p_mem_pos=%d\n", mmu_pmem[initial_pos].pid, mmu_pmem[initial_pos].date_start,
+           initial_pos);
+    mmu_pmem[initial_pos] = empty_space;
 }
 
-void mmu_new_process(PROCESS new_process) {
-    int vmem_initial_position = 0, pmem_initial_position = 0;
+void mmu_load_mem(PROCESS new_process){
+    // Store all blocks of process
+    for (int i = 0; i < new_process.block; i++) {
+        int empty_frame = mmu_search_for_empty_frame(mmu_pmem);
 
-    // If theres not enough PAGES, free some
-    if (mmu_search_for_empty_block(mmu_vmem, VMEM_ARR_SIZE, new_process.size / 8) < 0) {
-        printf("VMEM Page Fault - Removing the oldest\n");
-        mmu_free_mem(mmu_vmem, VMEM_ARR_SIZE, new_process);
+        if (empty_frame >= 0) {
+            mmu_pmem[empty_frame] = new_process;
+        } else {
+            mmu_free_mem(mmu_pmem);
+            mmu_pmem[mmu_search_for_empty_frame(mmu_pmem)] = new_process;
+        }
+        // Process Ages per cicle
+        new_process.date_start++;
     }
+}
+void mmu_write_process(PROCESS new_process) {
 
-    vmem_initial_position = mmu_search_for_empty_block(mmu_vmem, VMEM_ARR_SIZE, new_process.size / 8);
-    mmu_store_process(mmu_vmem, VMEM_ARR_SIZE, new_process, vmem_initial_position);
+    mmu_load_mem(new_process);
 
-// TODO PMEM
-//    pmem_initial_position = mmu_search_for_empty_block(mmu_pmem, PMEM_ARR_SIZE, new_process.size / 8);
-//    mmu_store_process(new_process, pmem_initial_position);
+    printf("[MMU][WRITE] pid=%d data=%s\n\n", new_process.pid, new_process.data);
+}
 
-    printf("[MMU] New Process stored vmem_pages=%d~%d\n", vmem_initial_position,
-           vmem_initial_position + new_process.size / 8);
+void mmu_read_process(int PID) {
+    PROCESS new = process_table[PID];
+
+    // Load to memory
+    mmu_load_mem(new);
+
+    printf("[MMU][READ] pid=%d data=%s\n\n", new.pid, new.data);
 }
 
 void mmu_management() {
     while (1) {
         // Wait for a new process to be created
         sem_wait(&s0);
-        mmu_new_process(buffer);
-        buffer = empty_space;
+        if (write_buffer.pid != empty_space.pid) {
+            mmu_write_process(write_buffer);
+            write_buffer = empty_space;
+        }
+        if (read_buffer != empty_space.pid) {
+            mmu_read_process(read_buffer);
+            read_buffer = empty_space.pid;
+        }
     }
 }
 
-void mmu_printf(PROCESS new_process) {
-    printf("[PMEM] PID=%d DATA=%d\n", new_process.pid, new_process.data);
-}
-
 // min 1 byte max 1MB
-void *Processor() {
+void process_management() {
     PROCESS new_process;
+    int flip = 1;
     while (1) {
         sleep(rand() % 5 + 4);
+        if (flip) {
+            // Write a new process
+            new_process.pid = PID++;
+            new_process.size = rand() % 1000;
+            new_process.block = new_process.size / 8;
+            new_process.date_start = (int) time(NULL) / 2;
+            strcpy(new_process.data, planet_names[rand() % 8]);
 
-        new_process.pid = PID++;
-        new_process.size = rand() % 1024;
-        new_process.date_start = (int) time(NULL); // Use Epoch time
-        strcpy(new_process.data, planet_names[rand() % 8]);
+            printf("[PROCESS][NEW] pid=%d size=%d pages=%d date_start=%d data=%s\n\n", new_process.pid, new_process.size,
+                   new_process.block, new_process.date_start, new_process.data);
 
-        printf("\n[NEW] pid=%d size=%d block=%d date_start=%d data=%s\n", new_process.pid, new_process.size,
-               new_process.size / 8, new_process.date_start, new_process.data);
-
-        buffer = new_process;
-        sem_post(&s0);
+            process_table[new_process.pid] = new_process;
+            write_buffer = new_process;
+            flip = 0;
+            sem_post(&s0);
+        } else {
+            // Read an existing process
+            read_buffer = (rand() % PID + 1 - 1) + 1;
+            printf("[PROCESS][READ] pid=%d\n\n",read_buffer);
+            flip = 1;
+            sem_post(&s0);
+        }
     }
 }
 
@@ -161,14 +166,14 @@ void main(void) {
     sem_init(&s0, 0, 0);
     pthread_t processor, mmu;
 
-    mmu_init_vmem();
+    mmu_init_process_table();
     mmu_init_pmem();
 
-    (void) pthread_create(&processor, NULL, Processor, NULL);
-    (void) pthread_create(&mmu, NULL, mmu_management, NULL);
+    (void) pthread_create(&processor, NULL, process_management, NULL);
+    (void) pthread_create(&mmu, NULL, (void *(*)(void *)) mmu_management, NULL);
 
-    (void) pthread_join(&processor, NULL);
-    (void) pthread_join(&mmu_management, NULL);
+    (void) pthread_join((pthread_t) &processor, NULL);
+    (void) pthread_join((pthread_t) &mmu_management, NULL);
 }
 
 #pragma clang diagnostic pop
